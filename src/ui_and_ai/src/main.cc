@@ -170,7 +170,7 @@ void print_help() {
 }
 
 /**
- * @brief AI 推理主循环：处理 DMA Buffer 流，并根据状态执行人脸检测、识别、注册等操作
+ * @brief AI 推理主循环：处理 DMA Buffer 流，并根据状态代表人脸检测、识别、注册等操作
  *
  * @param argv           命令行参数数组（包含模型路径、阈值、数据库目录等）
  * @param video_device   V4L2 视频设备编号
@@ -231,32 +231,55 @@ void face_proc(char *argv[], int video_device) {
         int ret = v4l2_drm_dump(&context, 1000);
         if (ret) {
             perror("v4l2_drm_dump error");
+            // 修复1: 当v4l2_drm_dump失败时，确保调用release以正确释放资源
+            v4l2_drm_dump_release(&context);
             continue;
         }
         //---------------------------------- 状态处理分支 ----------------------------------
-        std::lock_guard<std::mutex> lock(cur_state_mutex);
-        std::lock_guard<std::mutex> d_lock(display_state_mutex);
-        if (cur_state == 1) { // 正常识别状态
+        // 修复2: 减少锁的持有时间，避免长时间锁定
+        int current_state;
+        int current_display_state;
+        {
+            std::lock_guard<std::mutex> lock(cur_state_mutex);
+            current_state = cur_state;
+        }
+        {
+            std::lock_guard<std::mutex> d_lock(display_state_mutex);
+            current_display_state = display_state;
+        }
+        
+        if (current_state == 1) { // 正常识别状态
             runtime_tensor input_tensor = sensor_buf.get_buf_for_index(context.vbuffer.index);
             fd.pre_process(input_tensor);
             kpu_mutex.lock();
             fd.inference();
             kpu_mutex.unlock();
-            result_mutex.lock();
-            face_results.clear();
-            face_rec_results.clear();
-            cur_rec_res.clear();
-            fd.post_process({SENSOR_WIDTH, SENSOR_HEIGHT}, face_results);
-            for (int i = 0; i < face_results.size(); ++i) {
-                face_recg.pre_process(input_tensor, face_results[i].sparse_kps.points);
+            
+            // 修复3: 优化result_mutex的使用范围
+            std::vector<FaceDetectionInfo> temp_face_results;
+            std::vector<FaceRecognitionInfo> temp_face_rec_results;
+            std::vector<string> temp_cur_rec_res;
+            
+            fd.post_process({SENSOR_WIDTH, SENSOR_HEIGHT}, temp_face_results);
+            for (int i = 0; i < temp_face_results.size(); ++i) {
+                face_recg.pre_process(input_tensor, temp_face_results[i].sparse_kps.points);
                 kpu_mutex.lock();
                 face_recg.inference();
                 kpu_mutex.unlock();
                 FaceRecognitionInfo recg_result;
                 face_recg.database_search(recg_result);
-                face_rec_results.push_back(recg_result);
-                cur_rec_res.push_back(recg_result.name);
+                temp_face_rec_results.push_back(recg_result);
+                temp_cur_rec_res.push_back(recg_result.name);
             }
+            
+            // 只在更新共享数据时锁定result_mutex
+            result_mutex.lock();
+            face_results.swap(temp_face_results);
+            face_rec_results.swap(temp_face_rec_results);
+            cur_rec_res.swap(temp_cur_rec_res);
+            result_mutex.unlock();
+            
+            // 处理跟踪逻辑（不需要result_mutex保护）
             diff_rec_res.clear();
             // Step 1: 遍历当前帧所有人脸，更新跟踪状态
             for (const auto& cur_face : cur_rec_res) {
@@ -305,20 +328,28 @@ void face_proc(char *argv[], int video_device) {
                 std::string textString = j.dump();
                 g_ipc_wakeup_detect_control_ep->send(g_ipc_wakeup_detect_control_ep, textString.data(), textString.size());
             }
-            result_mutex.unlock();
-            cur_state = 1;
+            
+            // 修复4: 分别锁定状态变量
+            {   
+                std::lock_guard<std::mutex> lock(cur_state_mutex);
+                cur_state = 1;
+            }
         }
-        else if (cur_state == 2) { // 显示注册人数
+        else if (current_state == 2) { // 显示注册人数
             reg_num = face_recg.database_count(db_rec);
             ai_message.data = reg_num;
             ai_message.error_message = empty_str;
             ai_message.success = 1;
             mq->SendAIMsg(&ai_message);
 
-            cur_state = 1;
+            // 修复: 使用局部锁
+            {   
+                std::lock_guard<std::mutex> lock(cur_state_mutex);
+                cur_state = 1;
+            }
         }
 
-        else if (cur_state == 3) { // 抓取注册图片
+        else if (current_state == 3) { // 抓取注册图片
             dump_img.setTo(cv::Scalar(0, 0, 0));
             sensor_bgr.clear();
             void* data = context.buffers[0].mmap;
@@ -327,6 +358,8 @@ void face_proc(char *argv[], int video_device) {
             cv::Mat ori_img_R(SENSOR_HEIGHT, SENSOR_WIDTH, CV_8UC1, data + 2 * SENSOR_HEIGHT * SENSOR_WIDTH);
             if (ori_img_B.empty() || ori_img_G.empty() || ori_img_R.empty()) {
                 std::cout << "One or more of the channel images is empty." << std::endl;
+                // 确保释放资源后再continue
+                v4l2_drm_dump_release(&context);
                 continue;
             }
             sensor_bgr.push_back(ori_img_R);
@@ -338,18 +371,33 @@ void face_proc(char *argv[], int video_device) {
             ai_message.success = 1;
             mq->SendAIMsg(&ai_message);
 
-            cur_state = 1;
-            display_state = 3;
+            // 修复: 分别锁定不同的互斥锁
+            {   
+                std::lock_guard<std::mutex> lock(cur_state_mutex);
+                cur_state = 1;
+            }
+            {   
+                std::lock_guard<std::mutex> d_lock(display_state_mutex);
+                display_state = 3;
+            }
         }
-        else if(cur_state==4){
+        else if(current_state==4){
             ai_message.data = reg_num;
             ai_message.error_message = empty_str;
             ai_message.success = 1;
             mq->SendAIMsg(&ai_message);
-            cur_state = 1;
-            display_state = 1;
+            
+            // 修复: 分别锁定不同的互斥锁
+            {   
+                std::lock_guard<std::mutex> lock(cur_state_mutex);
+                cur_state = 1;
+            }
+            {   
+                std::lock_guard<std::mutex> d_lock(display_state_mutex);
+                display_state = 1;
+            }
         }
-        else if (cur_state == 5) { // 注册模式
+        else if (current_state == 5) { // 注册模式
             int ori_w = dump_img.cols;
             int ori_h = dump_img.rows;
             std::vector<uint8_t> chw_vec;
@@ -370,10 +418,18 @@ void face_proc(char *argv[], int video_device) {
             kpu_mutex.lock();
             fd.inference();
             kpu_mutex.unlock();
+            
+            // 修复: 优化result_mutex使用范围
+            std::vector<FaceDetectionInfo> temp_face_results;
+            
+            fd.post_process({SENSOR_WIDTH, SENSOR_HEIGHT}, temp_face_results);
+            int face_num = temp_face_results.size();
+            
+            // 只在更新共享数据时锁定result_mutex
             result_mutex.lock();
-            face_results.clear();
-            fd.post_process({SENSOR_WIDTH, SENSOR_HEIGHT}, face_results);
-            int face_num = face_results.size();
+            face_results.swap(temp_face_results);
+            result_mutex.unlock();
+            
             if (face_num == 1) {
                 face_recg.pre_process(ai2d_in_tensor, face_results[0].sparse_kps.points);
                 kpu_mutex.lock();
@@ -386,35 +442,63 @@ void face_proc(char *argv[], int video_device) {
                 ai_message.error_message = empty_str;
                 ai_message.success = 1;
                 mq->SendAIMsg(&ai_message);
-                cur_state = 1;
-                display_state = 1;
+                
+                // 修复: 分别锁定不同的互斥锁
+                {   
+                    std::lock_guard<std::mutex> lock(cur_state_mutex);
+                    cur_state = 1;
+                }
+                {   
+                    std::lock_guard<std::mutex> d_lock(display_state_mutex);
+                    display_state = 1;
+                }
             } else if(face_num > 1){
                 char error_message[] = "该图像包含多张人脸，注册失败！";
                 ai_message.data = reg_num;
                 ai_message.error_message = error_message;
                 ai_message.success = 0;
                 mq->SendAIMsg(&ai_message);
-                cur_state = 1;
-                display_state = 1;
+                
+                // 修复: 分别锁定不同的互斥锁
+                {   
+                    std::lock_guard<std::mutex> lock(cur_state_mutex);
+                    cur_state = 1;
+                }
+                {   
+                    std::lock_guard<std::mutex> d_lock(display_state_mutex);
+                    display_state = 1;
+                }
             }else{
                 char error_message[] = "该图像无法检测到人脸，注册失败！";
                 ai_message.data = reg_num;
                 ai_message.error_message = error_message;
                 ai_message.success = 0;
                 mq->SendAIMsg(&ai_message);
-                cur_state = 1;
-                display_state = 1;
+                
+                // 修复: 分别锁定不同的互斥锁
+                {   
+                    std::lock_guard<std::mutex> lock(cur_state_mutex);
+                    cur_state = 1;
+                }
+                {   
+                    std::lock_guard<std::mutex> d_lock(display_state_mutex);
+                    display_state = 1;
+                }
             }
-            result_mutex.unlock();
         }
-        else if (cur_state == 6) { //数据库清空
+        else if (current_state == 6) { //数据库清空
             face_recg.database_reset(db_rec);
             reg_num = face_recg.database_count(db_rec);
             ai_message.data = reg_num;
             ai_message.error_message = empty_str;
             ai_message.success = 1;
             mq->SendAIMsg(&ai_message);
-            cur_state = 1;
+            
+            // 修复: 使用局部锁
+            {   
+                std::lock_guard<std::mutex> lock(cur_state_mutex);
+                cur_state = 1;
+            }
         }
         //---------------------------------- 状态处理结束 ----------------------------------
         kpu_frame_count += 1;
@@ -543,7 +627,88 @@ void kws_proc(char *argv[]){
  * @param displayed 表示该帧是否已经被实际显示
  * @return 返回 0 表示正常，返回 'q' 表示请求退出主循环（受控于 display_stop 标志）
  */
-int frame_handler(struct v4l2_drm_context *context, bool displayed)
+int frame_handler(struct v4l2_drm_context *context, bool displayed) {
+    // 第一帧解锁互斥锁，允许AI线程开始运行
+    static bool first_frame = true;
+    if (first_frame) {
+        first_frame = false;
+        main_thread_mutex.unlock();
+    }
+
+    if (displayed) {
+        static int cnt = 0;
+        cnt++;
+    }
+
+    // 检查buffer_hold状态，确保数据帧有效
+    // 修复: 更严格地检查buffer_hold状态，确保只处理有效的帧数据
+    if (context->buffer_hold[context->vbuffer.index] != 0) {
+        std::cout << "frame_handler: buffer_hold[" << context->vbuffer.index << "] = " << context->buffer_hold[context->vbuffer.index] << "，跳过无效帧" << std::endl;
+        return 0; // 如果buffer_hold不为0，跳过处理，避免绘制无效数据
+    }
+
+    // 横屏状态下的人脸检测框绘制逻辑
+    if (context->drm_context.mode == 0) { // 横屏状态
+        if (display_state == 0) { // 识别状态
+            // 获取识别结果（最小化锁的持有时间）
+            std::vector<FaceDetectionInfo> local_face_results;
+            std::vector<FaceRecognitionInfo> local_face_rec_results;
+            {
+                std::lock_guard<std::mutex> r_lock(result_mutex);
+                local_face_results = face_results;
+                local_face_rec_results = face_rec_results;
+            }
+
+            for (int i = 0; i < local_face_results.size(); ++i) {
+                // 绘制人脸框
+                cv::rectangle(osd_plane[0].frame_buffer, local_face_results[i].rect, cv::Scalar(0, 0, 255), 2);
+                // 绘制人脸名称
+                cv::putText(osd_plane[0].frame_buffer, local_face_rec_results[i].name, 
+                            cv::Point(local_face_results[i].rect.x, local_face_results[i].rect.y - 5),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 0, 0), 2);
+            }
+        } else if (display_state == 2) { // dump状态
+            // 调整图像大小到左上角ROI区域
+            cv::resize(dump_img, osd_plane[0].frame_buffer(cv::Rect(0, 0, 320, 240)), cv::Size(320, 240));
+        }
+    } else { // 默认的识别状态
+        // 修复: 减少锁的持有时间，先获取状态，再进行处理
+        int current_display_state;
+        {
+            std::lock_guard<std::mutex> d_lock(display_state_mutex);
+            current_display_state = display_state;
+        }
+
+        if (current_display_state == 0) { // 识别状态
+            // 获取识别结果（最小化锁的持有时间）
+            std::vector<FaceDetectionInfo> local_face_results;
+            std::vector<FaceRecognitionInfo> local_face_rec_results;
+            {
+                std::lock_guard<std::mutex> r_lock(result_mutex);
+                local_face_results = face_results;
+                local_face_rec_results = face_rec_results;
+            }
+
+            for (int i = 0; i < local_face_results.size(); ++i) {
+                // 绘制人脸框
+                cv::rectangle(osd_plane[0].frame_buffer, local_face_results[i].rect, cv::Scalar(0, 0, 255), 2);
+                // 绘制人脸名称
+                cv::putText(osd_plane[0].frame_buffer, local_face_rec_results[i].name, 
+                            cv::Point(local_face_results[i].rect.x, local_face_results[i].rect.y - 5),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 0, 0), 2);
+            }
+        } else if (current_display_state == 2) { // dump状态
+            // 调整图像大小到左上角ROI区域
+            cv::resize(dump_img, osd_plane[0].frame_buffer(cv::Rect(0, 0, 320, 240)), cv::Size(320, 240));
+        }
+    }
+
+    // 修复: 确保buffer_hold状态正确，设置为0表示处理完毕
+    context->buffer_hold[context->vbuffer.index] = 0;
+
+    return 0;
+}
+
 {
     static bool first_frame = true;
     if (first_frame) {
